@@ -28,7 +28,7 @@ from collector import PulseCollector
 
 INJECT_PATH = ROOT / "inject.js"
 AVATARS_DIR = ROOT / "avatars"
-CAPSULE_VERSION = "0.1.5"
+CAPSULE_VERSION = "0.1.7"
 
 
 def load_inject_script():
@@ -129,18 +129,74 @@ def extract_conversation_id(url):
     return m.group(1) if m else None
 
 
-def snapshot_for_target(collector, target, cache, force_quota=False):
-    """按窗口当前对话 ID 精准采集，并在同轮多窗口间复用结果以节省开销。"""
-    cid = extract_conversation_id(target.get("url"))
+def extract_title_hint(raw_title):
+    """从窗口标题（如 'What Is A Workflow - gemini - Antigravity'）提取对话名。"""
+    if not raw_title:
+        return None
+    s = str(raw_title).strip()
+    if " - " in s:
+        head = s.split(" - ", 1)[0].strip()
+        if head and head.lower() not in ("antigravity", "new conversation"):
+            return head
+    return s if s and s.lower() not in ("antigravity", "new conversation") else None
+
+
+def resolve_cid_by_title(collector, title_hint, cache):
+    """当 URL 未随同工作区切换更新时，通过标题反查真实 conversationId。"""
+    if not title_hint:
+        return None
+    if "__base__" not in cache:
+        cache["__base__"] = collector.snapshot(force_quota=False)
+    convs = (cache["__base__"] or {}).get("conversations") or []
+    hint_low = title_hint.lower()
+    for c in convs:
+        ct = str(c.get("title") or "").strip().lower()
+        if ct and (ct == hint_low or ct.startswith(hint_low[:24]) or hint_low.startswith(ct[:24])):
+            return c.get("id")
+    return None
+
+
+def snapshot_for_target(collector, target, cache, hint_info=None, prefer_title=False, force_quota=False):
+    """按窗口当前对话 ID 或标题反查精准采集，并在同轮多窗口间复用结果以节省开销。"""
+    url = (hint_info or {}).get("href") or target.get("url")
+    title_raw = (hint_info or {}).get("title") or target.get("title")
+    cid = extract_conversation_id(url)
+    title_hint = extract_title_hint(title_raw)
+
+    # 若同工作区切换导致 URL 仍停在旧会话但标题已变，优先用标题反查新 ID
+    if prefer_title and title_hint:
+        by_title = resolve_cid_by_title(collector, title_hint, cache)
+        if by_title:
+            cid = by_title
+
     key = cid or "__latest__"
     if key not in cache:
         snap = collector.snapshot(force_quota=force_quota, conversation_id=cid)
-        # 若已明确切到新建空白对话但后端尚未生成记录，不拿旧对话顶替
         if cid and isinstance(snap.get("speed"), dict) and snap["speed"].get("conversationId") != cid:
             snap = dict(snap)
             snap["speed"] = None
         cache[key] = snap
-    return cid, cache[key]
+
+    # 二次兜底：若按 URL 拿到的标题与窗口当前标题明显不一致，尝试反查匹配
+    snap = cache[key]
+    cur_speed_title = ((snap.get("speed") or {}).get("title") or "").strip().lower()
+    if title_hint and cur_speed_title and not (
+        cur_speed_title == title_hint.lower()
+        or cur_speed_title.startswith(title_hint.lower()[:20])
+        or title_hint.lower().startswith(cur_speed_title[:20])
+    ):
+        by_title = resolve_cid_by_title(collector, title_hint, cache)
+        if by_title and by_title != cid:
+            cid = by_title
+            if cid not in cache:
+                s2 = collector.snapshot(force_quota=force_quota, conversation_id=cid)
+                if isinstance(s2.get("speed"), dict) and s2["speed"].get("conversationId") != cid:
+                    s2 = dict(s2)
+                    s2["speed"] = None
+                cache[cid] = s2
+            snap = cache[cid]
+
+    return cid, title_hint, snap
 
 
 def fetch_main_targets(port, timeout=1.5):
@@ -297,6 +353,16 @@ def update_target(ws_url, snapshot_json):
     return cdp_eval(ws_url, expr, timeout=2.5)
 
 
+def get_target_hint(ws_url):
+    expr = (
+        f"(() => {{ if (window !== window.top) return null; "
+        f"if (!window.__agCapsule || window.__agCapsule.version !== '{CAPSULE_VERSION}' || !window.__agCapsule.isMounted()) "
+        f"return {{needMount: true}}; "
+        f"return window.__agCapsule.hint ? window.__agCapsule.hint() : {{href: location.href, title: document.title}}; }})()"
+    )
+    return cdp_eval(ws_url, expr, timeout=1.5)
+
+
 def remove_targets(targets):
     expr = "(() => window.__agCapsule && window.__agCapsule.destroy ? window.__agCapsule.destroy() : {status: 'not_mounted'})()"
     results = []
@@ -327,6 +393,7 @@ def watch_loop(explicit_port=None, interval=2.0):
     last_inject_mtime = INJECT_PATH.stat().st_mtime
     mounted_urls = set()
     last_target_cid = {}
+    last_target_title = {}
     last_pushed_sig = {}
     last_pushed_at = {}
     active_port = explicit_port
@@ -343,6 +410,7 @@ def watch_loop(explicit_port=None, interval=2.0):
                 last_inject_mtime = cur_mtime
                 mounted_urls.clear()
                 last_target_cid.clear()
+                last_target_title.clear()
                 last_pushed_sig.clear()
                 last_pushed_at.clear()
                 print("检测到 inject.js 更新，准备热重载悬浮胶囊...", flush=True)
@@ -365,16 +433,15 @@ def watch_loop(explicit_port=None, interval=2.0):
                     ws_url = t["webSocketDebuggerUrl"]
                     alive_urls.add(ws_url)
                     try:
-                        cid, snap = snapshot_for_target(collector, t, snap_cache, force_quota=False)
-                        snap_json = json.dumps(snap, ensure_ascii=False)
-                        sig = json.dumps({k: v for k, v in snap.items() if k != "serverTimeMs"}, sort_keys=True, ensure_ascii=False)
-                        cid_changed = last_target_cid.get(ws_url) != cid
-
                         if ws_url not in mounted_urls:
+                            cid, thint, snap = snapshot_for_target(collector, t, snap_cache, force_quota=False)
+                            snap_json = json.dumps(snap, ensure_ascii=False)
+                            sig = json.dumps({k: v for k, v in snap.items() if k != "serverTimeMs"}, sort_keys=True, ensure_ascii=False)
                             res = mount_target(ws_url, inject_code, avatars_json, snap_json)
                             if isinstance(res, dict) and res.get("status") in ("updated", "skip_frame"):
                                 mounted_urls.add(ws_url)
                                 last_target_cid[ws_url] = cid
+                                last_target_title[ws_url] = thint
                                 last_pushed_sig[ws_url] = sig
                                 last_pushed_at[ws_url] = now_mono
                                 pushed_any = True
@@ -383,30 +450,58 @@ def watch_loop(explicit_port=None, interval=2.0):
                                         all_hidden = False
                                     print(f"[{t.get('title') or 'Antigravity'}] 悬浮胶囊已挂载", flush=True)
                         else:
-                            # 对话未切换且数据完全未变（30 秒内），跳过无效 CDP 通信
-                            if not cid_changed and last_pushed_sig.get(ws_url) == sig and (now_mono - last_pushed_at.get(ws_url, 0.0)) < 30.0:
-                                all_hidden = False
-                                continue
-                            res = update_target(ws_url, snap_json)
-                            pushed_any = True
-                            if isinstance(res, dict) and res.get("status") == "need_mount":
+                            hint = get_target_hint(ws_url) or {}
+                            if hint.get("needMount"):
+                                cid, thint, snap = snapshot_for_target(collector, t, snap_cache, force_quota=False)
+                                snap_json = json.dumps(snap, ensure_ascii=False)
+                                sig = json.dumps({k: v for k, v in snap.items() if k != "serverTimeMs"}, sort_keys=True, ensure_ascii=False)
                                 res = mount_target(ws_url, inject_code, avatars_json, snap_json)
+                                pushed_any = True
                                 if isinstance(res, dict) and res.get("status") == "updated":
                                     if not res.get("hidden"):
                                         all_hidden = False
                                     print(f"[{t.get('title') or 'Antigravity'}] 页面重载，已重新挂载悬浮胶囊", flush=True)
-                            elif isinstance(res, dict) and not res.get("hidden"):
+                                last_target_cid[ws_url] = cid
+                                last_target_title[ws_url] = thint
+                                last_pushed_sig[ws_url] = sig
+                                last_pushed_at[ws_url] = now_mono
+                                continue
+
+                            cur_thint = extract_title_hint(hint.get("title") or t.get("title"))
+                            title_changed = bool(cur_thint and last_target_title.get(ws_url) and cur_thint != last_target_title.get(ws_url))
+                            cid, thint, snap = snapshot_for_target(
+                                collector,
+                                t,
+                                snap_cache,
+                                hint_info=hint,
+                                prefer_title=title_changed,
+                                force_quota=False,
+                            )
+                            snap_json = json.dumps(snap, ensure_ascii=False)
+                            sig = json.dumps({k: v for k, v in snap.items() if k != "serverTimeMs"}, sort_keys=True, ensure_ascii=False)
+                            cid_changed = last_target_cid.get(ws_url) != cid
+
+                            if not cid_changed and not title_changed and last_pushed_sig.get(ws_url) == sig and (now_mono - last_pushed_at.get(ws_url, 0.0)) < 30.0:
+                                if not hint.get("hidden"):
+                                    all_hidden = False
+                                continue
+
+                            res = update_target(ws_url, snap_json)
+                            pushed_any = True
+                            if isinstance(res, dict) and not res.get("hidden"):
                                 all_hidden = False
                             last_target_cid[ws_url] = cid
+                            last_target_title[ws_url] = thint
                             last_pushed_sig[ws_url] = sig
                             last_pushed_at[ws_url] = now_mono
                     except Exception:
                         mounted_urls.discard(ws_url)
                         last_target_cid.pop(ws_url, None)
+                        last_target_title.pop(ws_url, None)
                         last_pushed_sig.pop(ws_url, None)
                         last_pushed_at.pop(ws_url, None)
                 mounted_urls.intersection_update(alive_urls)
-                if mounted_urls and pushed_any and all_hidden:
+                if mounted_urls and all_hidden:
                     sleep_sec = 15.0
             else:
                 if not warned_no_port and time.monotonic() - started_at >= 10.0:
@@ -490,7 +585,7 @@ def main():
         avatars_json = json.dumps(load_avatar_data_uris(), ensure_ascii=False)
         out = []
         for t in targets:
-            _, snap = snapshot_for_target(collector, t, snap_cache, force_quota=True)
+            _, _, snap = snapshot_for_target(collector, t, snap_cache, force_quota=True)
             res = mount_target(t["webSocketDebuggerUrl"], inject_code, avatars_json, json.dumps(snap, ensure_ascii=False))
             out.append({"title": t.get("title"), "result": res})
         print(json.dumps(out, ensure_ascii=False, indent=2))

@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = "0.1.5";
+  const VERSION = "0.1.7";
   const HOST_ID = "ag-star-capsule-host";
   const STORE_KEY = "ag_star_capsule_prefs_v2";
 
@@ -1460,8 +1460,20 @@
       return { status: "need_mount" };
     }
     render(snap);
-    return { status: "updated", hidden: Boolean(document.hidden) };
+    return {
+      status: "updated",
+      hidden: Boolean(document.hidden),
+      href: location.href,
+      title: document.title,
+    };
   };
+
+  const hint = () => ({
+    mounted: Boolean(host && document.contains(host)),
+    hidden: Boolean(document.hidden),
+    href: location.href,
+    title: document.title,
+  });
 
   const destroy = () => {
     clearTimeout(manualMoodTimer);
@@ -1485,6 +1497,7 @@
     version: VERSION,
     mount,
     update,
+    hint,
     destroy,
     isMounted: () => Boolean(host && document.contains(host)),
   };
