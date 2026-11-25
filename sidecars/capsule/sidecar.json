@@ -1,0 +1,12 @@
+{
+  "command": "python",
+  "args": [
+    "-B",
+    "capsule.py",
+    "--watch"
+  ],
+  "restart_policy": "always",
+  "display_name": "星轨猫猫悬浮胶囊",
+  "description": "后台常驻采集本机 Antigravity 实时指标，并通过 CDP 在主窗口渲染可拖拽液态玻璃悬浮胶囊。",
+  "has_web_ui": false
+}
