@@ -10,6 +10,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import signal
 import socket
 import struct
@@ -118,6 +119,28 @@ def is_main_window_target(target):
     if "antigravity-pulse" in url or "sidecar" in url:
         return False
     return True
+
+
+def extract_conversation_id(url):
+    """从主窗口 URL 中提取当前正在浏览的对话 ID（/c/<uuid>）。"""
+    if not url:
+        return None
+    m = re.search(r"/c/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", str(url))
+    return m.group(1) if m else None
+
+
+def snapshot_for_target(collector, target, cache, force_quota=False):
+    """按窗口当前对话 ID 精准采集，并在同轮多窗口间复用结果以节省开销。"""
+    cid = extract_conversation_id(target.get("url"))
+    key = cid or "__latest__"
+    if key not in cache:
+        snap = collector.snapshot(force_quota=force_quota, conversation_id=cid)
+        # 若已明确切到新建空白对话但后端尚未生成记录，不拿旧对话顶替
+        if cid and isinstance(snap.get("speed"), dict) and snap["speed"].get("conversationId") != cid:
+            snap = dict(snap)
+            snap["speed"] = None
+        cache[key] = snap
+    return cid, cache[key]
 
 
 def fetch_main_targets(port, timeout=1.5):
@@ -287,7 +310,7 @@ def remove_targets(targets):
     return results
 
 
-def watch_loop(explicit_port=None, interval=3.5):
+def watch_loop(explicit_port=None, interval=2.0):
     running = True
 
     def _stop(_signum, _frame):
@@ -303,6 +326,7 @@ def watch_loop(explicit_port=None, interval=3.5):
     avatars_json = json.dumps(load_avatar_data_uris(), ensure_ascii=False)
     last_inject_mtime = INJECT_PATH.stat().st_mtime
     mounted_urls = set()
+    last_target_cid = {}
     last_pushed_sig = {}
     last_pushed_at = {}
     active_port = explicit_port
@@ -318,6 +342,7 @@ def watch_loop(explicit_port=None, interval=3.5):
                 inject_code = load_inject_script()
                 last_inject_mtime = cur_mtime
                 mounted_urls.clear()
+                last_target_cid.clear()
                 last_pushed_sig.clear()
                 last_pushed_at.clear()
                 print("检测到 inject.js 更新，准备热重载悬浮胶囊...", flush=True)
@@ -330,9 +355,7 @@ def watch_loop(explicit_port=None, interval=3.5):
             if port and cur_targets:
                 active_port = port
                 warned_no_port = False
-                snap = collector.snapshot(force_quota=False)
-                snap_json = json.dumps(snap, ensure_ascii=False)
-                sig = json.dumps({k: v for k, v in snap.items() if k != "serverTimeMs"}, sort_keys=True, ensure_ascii=False)
+                snap_cache = {}
                 now_mono = time.monotonic()
 
                 alive_urls = set()
@@ -342,10 +365,16 @@ def watch_loop(explicit_port=None, interval=3.5):
                     ws_url = t["webSocketDebuggerUrl"]
                     alive_urls.add(ws_url)
                     try:
+                        cid, snap = snapshot_for_target(collector, t, snap_cache, force_quota=False)
+                        snap_json = json.dumps(snap, ensure_ascii=False)
+                        sig = json.dumps({k: v for k, v in snap.items() if k != "serverTimeMs"}, sort_keys=True, ensure_ascii=False)
+                        cid_changed = last_target_cid.get(ws_url) != cid
+
                         if ws_url not in mounted_urls:
                             res = mount_target(ws_url, inject_code, avatars_json, snap_json)
                             if isinstance(res, dict) and res.get("status") in ("updated", "skip_frame"):
                                 mounted_urls.add(ws_url)
+                                last_target_cid[ws_url] = cid
                                 last_pushed_sig[ws_url] = sig
                                 last_pushed_at[ws_url] = now_mono
                                 pushed_any = True
@@ -354,8 +383,8 @@ def watch_loop(explicit_port=None, interval=3.5):
                                         all_hidden = False
                                     print(f"[{t.get('title') or 'Antigravity'}] 悬浮胶囊已挂载", flush=True)
                         else:
-                            # 闲置差分跳过：数据未变且距上次推送不足 30 秒，跳过无效 CDP 通信
-                            if last_pushed_sig.get(ws_url) == sig and (now_mono - last_pushed_at.get(ws_url, 0.0)) < 30.0:
+                            # 对话未切换且数据完全未变（30 秒内），跳过无效 CDP 通信
+                            if not cid_changed and last_pushed_sig.get(ws_url) == sig and (now_mono - last_pushed_at.get(ws_url, 0.0)) < 30.0:
                                 all_hidden = False
                                 continue
                             res = update_target(ws_url, snap_json)
@@ -368,10 +397,12 @@ def watch_loop(explicit_port=None, interval=3.5):
                                     print(f"[{t.get('title') or 'Antigravity'}] 页面重载，已重新挂载悬浮胶囊", flush=True)
                             elif isinstance(res, dict) and not res.get("hidden"):
                                 all_hidden = False
+                            last_target_cid[ws_url] = cid
                             last_pushed_sig[ws_url] = sig
                             last_pushed_at[ws_url] = now_mono
                     except Exception:
                         mounted_urls.discard(ws_url)
+                        last_target_cid.pop(ws_url, None)
                         last_pushed_sig.pop(ws_url, None)
                         last_pushed_at.pop(ws_url, None)
                 mounted_urls.intersection_update(alive_urls)
@@ -411,13 +442,14 @@ def main():
     parser.add_argument("--remove", action="store_true", help="从主窗口卸载悬浮胶囊")
     parser.add_argument("--status", action="store_true", help="检查 CDP 调试端口与指标采集状态")
     parser.add_argument("--port", type=int, default=None, help="手动指定 CDP 调试端口")
-    parser.add_argument("--interval", type=float, default=3.5, help="指标推送间隔秒数（默认 3.5）")
+    parser.add_argument("--interval", type=float, default=2.0, help="指标推送间隔秒数（默认 2.0）")
     args = parser.parse_args()
 
     if args.status:
         port, targets = discover_cdp(args.port)
         collector = PulseCollector()
-        snap = collector.snapshot(force_quota=True)
+        cid = extract_conversation_id(targets[0].get("url")) if targets else None
+        snap = collector.snapshot(force_quota=True, conversation_id=cid)
         print(
             json.dumps(
                 {
@@ -453,12 +485,13 @@ def main():
             print("未检测到带 CDP 调试端口的 Antigravity 主窗口。", file=sys.stderr)
             return 1
         collector = PulseCollector()
-        snap_json = json.dumps(collector.snapshot(force_quota=True), ensure_ascii=False)
+        snap_cache = {}
         inject_code = load_inject_script()
         avatars_json = json.dumps(load_avatar_data_uris(), ensure_ascii=False)
         out = []
         for t in targets:
-            res = mount_target(t["webSocketDebuggerUrl"], inject_code, avatars_json, snap_json)
+            _, snap = snapshot_for_target(collector, t, snap_cache, force_quota=True)
+            res = mount_target(t["webSocketDebuggerUrl"], inject_code, avatars_json, json.dumps(snap, ensure_ascii=False))
             out.append({"title": t.get("title"), "result": res})
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
