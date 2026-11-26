@@ -28,7 +28,7 @@ from collector import PulseCollector
 
 INJECT_PATH = ROOT / "inject.js"
 AVATARS_DIR = ROOT / "avatars"
-CAPSULE_VERSION = "0.1.7"
+CAPSULE_VERSION = "0.2.0"
 
 
 def load_inject_script():
@@ -113,12 +113,22 @@ def is_main_window_target(target):
     if target.get("type") != "page":
         return False
     url = str(target.get("url") or "").strip().lower()
-    if not url or url.startswith(("devtools://", "data:", "about:", "chrome-extension://")):
+    if not url:
         return False
-    # 排除侧栏插件自身的辅助页面
-    if "antigravity-pulse" in url or "sidecar" in url:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    # 仅按路径排除侧栏插件自身的辅助页面，避免误伤主窗口的 ?tab=sidecar__... 查询参数
+    path = parsed.path or ""
+    if "antigravity-pulse" in path or "sidecar" in path:
         return False
     return True
+
+
+def is_uuid(val):
+    if not val:
+        return False
+    return bool(re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", str(val).strip()))
 
 
 def extract_conversation_id(url):
@@ -157,14 +167,16 @@ def resolve_cid_by_title(collector, title_hint, cache):
 
 
 def snapshot_for_target(collector, target, cache, hint_info=None, prefer_title=False, force_quota=False):
-    """按窗口当前对话 ID 或标题反查精准采集，并在同轮多窗口间复用结果以节省开销。"""
+    """按窗口当前真实会话 ID、URL 或面包屑标题反查精准采集，并在同轮多窗口间复用结果以节省开销。"""
+    active_cid = ((hint_info or {}).get("activeCid") or "").strip()
     url = (hint_info or {}).get("href") or target.get("url")
-    title_raw = (hint_info or {}).get("title") or target.get("title")
-    cid = extract_conversation_id(url)
-    title_hint = extract_title_hint(title_raw)
+    crumb = ((hint_info or {}).get("crumbTitle") or "").strip()
+    title_raw = crumb or (hint_info or {}).get("title") or target.get("title")
+    cid = active_cid if is_uuid(active_cid) else extract_conversation_id(url)
+    title_hint = crumb or extract_title_hint(title_raw)
 
-    # 若同工作区切换导致 URL 仍停在旧会话但标题已变，优先用标题反查新 ID
-    if prefer_title and title_hint:
+    # 若尚未拿到 DOM 中的真实 UUID，且同工作区切换导致 URL 仍停在旧会话，再用标题反查新 ID
+    if not is_uuid(active_cid) and (prefer_title or crumb) and title_hint:
         by_title = resolve_cid_by_title(collector, title_hint, cache)
         if by_title:
             cid = by_title
@@ -467,7 +479,7 @@ def watch_loop(explicit_port=None, interval=2.0):
                                 last_pushed_at[ws_url] = now_mono
                                 continue
 
-                            cur_thint = extract_title_hint(hint.get("title") or t.get("title"))
+                            cur_thint = ((hint.get("crumbTitle") or "").strip()) or extract_title_hint(hint.get("title") or t.get("title"))
                             title_changed = bool(cur_thint and last_target_title.get(ws_url) and cur_thint != last_target_title.get(ws_url))
                             cid, thint, snap = snapshot_for_target(
                                 collector,

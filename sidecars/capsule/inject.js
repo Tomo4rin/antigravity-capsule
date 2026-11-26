@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = "0.1.7";
+  const VERSION = "0.2.0";
   const HOST_ID = "ag-star-capsule-host";
   const STORE_KEY = "ag_star_capsule_prefs_v2";
 
@@ -1455,6 +1455,56 @@
     return { status: "mounted" };
   };
 
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  const readActiveConversationId = () => {
+    try {
+      const nodes = document.querySelectorAll("[data-conversation-id], [data-cascade-id]");
+      for (let i = 0; i < nodes.length; i++) {
+        const el = nodes[i];
+        if (el.closest(".agy-sidebar-row")) continue;
+        const cid = (el.getAttribute("data-conversation-id") || el.getAttribute("data-cascade-id") || "").trim();
+        if (!UUID_RE.test(cid)) continue;
+        const st = getComputedStyle(el);
+        if (st.display === "none" || st.visibility === "hidden") continue;
+        const r = el.getBoundingClientRect();
+        if (r.width > 180 && r.height > 120) return cid;
+      }
+      const activeRow =
+        document.querySelector(".agy-sidebar-row.bg-sidebar-secondary[data-conversation-id]") ||
+        document.querySelector('.agy-sidebar-row[aria-current="page"][data-conversation-id]');
+      if (activeRow) {
+        const cid = (activeRow.getAttribute("data-conversation-id") || "").trim();
+        if (UUID_RE.test(cid)) return cid;
+      }
+    } catch (_) {}
+    return "";
+  };
+
+  const readBreadcrumbTitle = () => {
+    try {
+      const segs = document.querySelectorAll('[data-testid="breadcrumb-segment"]');
+      for (let i = segs.length - 1; i >= 0; i--) {
+        const seg = segs[i];
+        const r = seg.getBoundingClientRect();
+        if (r.width <= 0 || r.top < 0 || r.top > 90) continue;
+        const txt = (seg.textContent || "").replace(/Edits the conversation title/g, "").trim();
+        if (txt && i > 0) return txt;
+      }
+      for (let i = 0; i < segs.length; i++) {
+        const seg = segs[i];
+        const r = seg.getBoundingClientRect();
+        if (r.width <= 0 || r.top < 0 || r.top > 90) continue;
+        const li = seg.closest("li");
+        const next = li ? li.nextElementSibling : null;
+        if (!next) continue;
+        const txt = (next.textContent || "").replace(/Edits the conversation title/g, "").trim();
+        if (txt) return txt;
+      }
+    } catch (_) {}
+    return "";
+  };
+
   const update = (snap) => {
     if (!host || !document.contains(host)) {
       return { status: "need_mount" };
@@ -1465,6 +1515,8 @@
       hidden: Boolean(document.hidden),
       href: location.href,
       title: document.title,
+      crumbTitle: readBreadcrumbTitle(),
+      activeCid: readActiveConversationId(),
     };
   };
 
@@ -1473,6 +1525,8 @@
     hidden: Boolean(document.hidden),
     href: location.href,
     title: document.title,
+    crumbTitle: readBreadcrumbTitle(),
+    activeCid: readActiveConversationId(),
   });
 
   const destroy = () => {
