@@ -2,6 +2,6 @@
   "name": "antigravity-capsule",
   "display_name": "星轨猫猫悬浮胶囊",
   "description": "独立轻量 Windows 主窗口悬浮胶囊：通过本地 CDP 常驻一粒可拖拽液态玻璃胶囊，实时显示猫猫动态头像、上下文占用、生成速率与共享额度，不占侧栏空间。",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "logo": "assets/logo.svg"
 }

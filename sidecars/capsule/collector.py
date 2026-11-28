@@ -301,7 +301,7 @@ def compute_forecast(remaining, reset_ms, window_kind, now_ms):
     }
 
 
-def parse_trajectory_metrics(generators, steps=None, step_count=None, cascade_id=None):
+def parse_trajectory_metrics(generators, steps=None, step_count=None, cascade_id=None, steps_loaded=False):
     steps = steps or []
     seen_ids = set()
     samples = []
@@ -398,10 +398,13 @@ def parse_trajectory_metrics(generators, steps=None, step_count=None, cascade_id
     recent_tps = [round(s["tps"], 1) for s in accepted[-16:]]
 
     tool_intervals = []
+    rounds = 0 if steps_loaded else None
     for st in steps:
         if not isinstance(st, dict):
             continue
         stype = str(st.get("type") or "")
+        if steps_loaded and "USER_INPUT" in stype.upper():
+            rounds += 1
         meta = st.get("metadata") if isinstance(st.get("metadata"), dict) else {}
         if meta.get("toolCall") or re.search(r"COMMAND|READ|WRITE|EDIT|TOOL|MCP|SEARCH|BROWSE|VIEW|GREP", stype, re.I):
             a = parse_iso_ms(meta.get("startedAt") or meta.get("createdAt"))
@@ -435,6 +438,7 @@ def parse_trajectory_metrics(generators, steps=None, step_count=None, cascade_id
     return {
         "conversationId": cascade_id,
         "steps": step_count if step_count is not None else len(steps),
+        "rounds": rounds,
         "requests": len(seen_ids),
         "measuredRequests": len(accepted),
         "model": latest_model,
@@ -467,6 +471,7 @@ class PulseCollector:
         self.quota_cache = []
         self.quota_at = 0.0
         self.last_error = None
+        self._traj_cache = {}
 
     def ensure_server(self, force=False):
         now = time.monotonic()
@@ -544,32 +549,50 @@ class PulseCollector:
 
             speed = None
             if target_id:
-                gen_resp = rpc_post(
-                    srv["port"],
-                    srv["csrf"],
-                    "GetCascadeTrajectoryGeneratorMetadata",
-                    {"cascadeId": target_id, "includeMessages": False},
-                    timeout=6.0,
-                )
-                generators = gen_resp.get("generatorMetadata") or (gen_resp.get("trajectory") or {}).get("generatorMetadata") or []
                 step_count = parse_int((target_meta or {}).get("stepCount"))
-                steps = []
-                # 仅在步数适中时顺带拉取步数计时用于计算工具用时，避免超大长对话卡顿
-                if step_count is not None and step_count <= 1200:
-                    try:
-                        st_resp = rpc_post(
-                            srv["port"],
-                            srv["csrf"],
-                            "GetCascadeTrajectorySteps",
-                            {"cascadeId": target_id, "stepOffset": 0},
-                            timeout=5.0,
-                        )
-                        steps = st_resp.get("steps") or (st_resp.get("trajectory") or {}).get("steps") or []
-                    except Exception:
-                        steps = []
-                speed = parse_trajectory_metrics(generators, steps=steps, step_count=step_count, cascade_id=target_id)
-                if target_meta and target_meta.get("summary"):
-                    speed["title"] = str(target_meta["summary"])
+                last_mod = (target_meta or {}).get("lastModifiedTime")
+                traj_sig = (step_count, last_mod)
+                cached_traj = self._traj_cache.get(target_id)
+                if cached_traj and cached_traj.get("sig") == traj_sig:
+                    speed = dict(cached_traj["speed"])
+                else:
+                    gen_resp = rpc_post(
+                        srv["port"],
+                        srv["csrf"],
+                        "GetCascadeTrajectoryGeneratorMetadata",
+                        {"cascadeId": target_id, "includeMessages": False},
+                        timeout=6.0,
+                    )
+                    generators = gen_resp.get("generatorMetadata") or (gen_resp.get("trajectory") or {}).get("generatorMetadata") or []
+                    steps = []
+                    steps_loaded = False
+                    # 仅在步数适中时顺带拉取步数计时与轮数统计，避免超大长对话卡顿
+                    if step_count is not None and step_count <= 1200:
+                        try:
+                            st_resp = rpc_post(
+                                srv["port"],
+                                srv["csrf"],
+                                "GetCascadeTrajectorySteps",
+                                {"cascadeId": target_id, "stepOffset": 0},
+                                timeout=5.0,
+                            )
+                            steps = st_resp.get("steps") or (st_resp.get("trajectory") or {}).get("steps") or []
+                            steps_loaded = True
+                        except Exception:
+                            steps = []
+                            steps_loaded = False
+                    speed = parse_trajectory_metrics(
+                        generators,
+                        steps=steps,
+                        step_count=step_count,
+                        cascade_id=target_id,
+                        steps_loaded=steps_loaded,
+                    )
+                    if target_meta and target_meta.get("summary"):
+                        speed["title"] = str(target_meta["summary"])
+                    if len(self._traj_cache) >= 24:
+                        self._traj_cache.clear()
+                    self._traj_cache[target_id] = {"sig": traj_sig, "speed": dict(speed)}
 
             self.last_error = None
             return {
@@ -582,6 +605,7 @@ class PulseCollector:
             }
         except Exception as exc:
             self.server = None
+            self._traj_cache.clear()
             self.last_error = str(exc)
             return {
                 "connection": "stale",

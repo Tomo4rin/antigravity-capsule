@@ -28,7 +28,7 @@ from collector import PulseCollector
 
 INJECT_PATH = ROOT / "inject.js"
 AVATARS_DIR = ROOT / "avatars"
-CAPSULE_VERSION = "0.2.0"
+CAPSULE_VERSION = "0.2.1"
 
 
 def load_inject_script():
@@ -343,10 +343,11 @@ def cdp_eval(ws_url, expression, timeout=4.0):
         ws.close()
 
 
-def mount_target(ws_url, inject_code, avatars_json, snapshot_json):
+def mount_target(ws_url, inject_code, avatars_json, snapshot_json, force=False):
+    cond = "true" if force else f"!window.__agCapsule || window.__agCapsule.version !== '{CAPSULE_VERSION}'"
     expr = (
         f"(() => {{ if (window !== window.top) return {{status: 'skip_frame'}}; "
-        f"if (!window.__agCapsule || window.__agCapsule.version !== '{CAPSULE_VERSION}') {{ "
+        f"if ({cond}) {{ "
         f"if (window.__agCapsule && window.__agCapsule.destroy) {{ window.__agCapsule.destroy(); }} "
         f"delete window.__agCapsule; {inject_code} }} "
         f"window.__agCapsule.mount({avatars_json}); "
@@ -411,6 +412,7 @@ def watch_loop(explicit_port=None, interval=2.0):
     active_port = explicit_port
     started_at = time.monotonic()
     warned_no_port = False
+    force_reload = False
 
     print("antigravity-capsule Sidecar 悬浮胶囊监听已启动...", flush=True)
     while running:
@@ -425,6 +427,7 @@ def watch_loop(explicit_port=None, interval=2.0):
                 last_target_title.clear()
                 last_pushed_sig.clear()
                 last_pushed_at.clear()
+                force_reload = True
                 print("检测到 inject.js 更新，准备热重载悬浮胶囊...", flush=True)
 
             port, cur_targets = discover_cdp(active_port)
@@ -449,7 +452,7 @@ def watch_loop(explicit_port=None, interval=2.0):
                             cid, thint, snap = snapshot_for_target(collector, t, snap_cache, force_quota=False)
                             snap_json = json.dumps(snap, ensure_ascii=False)
                             sig = json.dumps({k: v for k, v in snap.items() if k != "serverTimeMs"}, sort_keys=True, ensure_ascii=False)
-                            res = mount_target(ws_url, inject_code, avatars_json, snap_json)
+                            res = mount_target(ws_url, inject_code, avatars_json, snap_json, force=force_reload)
                             if isinstance(res, dict) and res.get("status") in ("updated", "skip_frame"):
                                 mounted_urls.add(ws_url)
                                 last_target_cid[ws_url] = cid
@@ -481,19 +484,20 @@ def watch_loop(explicit_port=None, interval=2.0):
 
                             cur_thint = ((hint.get("crumbTitle") or "").strip()) or extract_title_hint(hint.get("title") or t.get("title"))
                             title_changed = bool(cur_thint and last_target_title.get(ws_url) and cur_thint != last_target_title.get(ws_url))
+                            want_quota = bool(hint.get("wantQuotaRefresh"))
                             cid, thint, snap = snapshot_for_target(
                                 collector,
                                 t,
                                 snap_cache,
                                 hint_info=hint,
                                 prefer_title=title_changed,
-                                force_quota=False,
+                                force_quota=want_quota,
                             )
                             snap_json = json.dumps(snap, ensure_ascii=False)
                             sig = json.dumps({k: v for k, v in snap.items() if k != "serverTimeMs"}, sort_keys=True, ensure_ascii=False)
                             cid_changed = last_target_cid.get(ws_url) != cid
 
-                            if not cid_changed and not title_changed and last_pushed_sig.get(ws_url) == sig and (now_mono - last_pushed_at.get(ws_url, 0.0)) < 30.0:
+                            if not want_quota and not cid_changed and not title_changed and last_pushed_sig.get(ws_url) == sig and (now_mono - last_pushed_at.get(ws_url, 0.0)) < 30.0:
                                 if not hint.get("hidden"):
                                     all_hidden = False
                                 continue
@@ -513,6 +517,7 @@ def watch_loop(explicit_port=None, interval=2.0):
                         last_pushed_sig.pop(ws_url, None)
                         last_pushed_at.pop(ws_url, None)
                 mounted_urls.intersection_update(alive_urls)
+                force_reload = False
                 if mounted_urls and all_hidden:
                     sleep_sec = 15.0
             else:

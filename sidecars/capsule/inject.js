@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = "0.2.0";
+  const VERSION = "0.2.1";
   const HOST_ID = "ag-star-capsule-host";
   const STORE_KEY = "ag_star_capsule_prefs_v2";
 
@@ -632,6 +632,60 @@
     .bar-fill.warn { background: linear-gradient(90deg, #f59e0b, #fb923c); }
     .bar-fill.bad { background: linear-gradient(90deg, #f43f5e, #fb923c); }
 
+    .round-pill {
+      display: inline-flex;
+      align-items: center;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 1px 7px;
+      border-radius: 999px;
+      background: rgba(124, 58, 237, 0.13);
+      color: var(--accent-purple);
+      font-variant-numeric: tabular-nums;
+    }
+    .wrap.dark .round-pill {
+      background: rgba(167, 139, 250, 0.18);
+      color: #c4b5fd;
+    }
+    .tok-bar {
+      display: flex;
+      width: 100%;
+      height: 5px;
+      border-radius: 999px;
+      background: var(--track);
+      overflow: hidden;
+      gap: 1px;
+    }
+    .tok-seg {
+      height: 100%;
+      min-width: 0;
+      transition: width 0.36s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .tok-seg.read { background: linear-gradient(90deg, #10b981, #34d399); }
+    .tok-seg.miss { background: linear-gradient(90deg, #3b82f6, #60a5fa); }
+    .tok-seg.out { background: linear-gradient(90deg, #8b5cf6, #a78bfa); }
+    .tok-sub {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      margin-top: 6px;
+      font-size: 10px;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+    .tok-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      white-space: nowrap;
+    }
+    .tok-item strong { color: var(--text); font-weight: 700; }
+    .tok-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+    .tok-dot.read { background: #10b981; }
+    .tok-dot.miss { background: #3b82f6; }
+    .tok-dot.out { background: #8b5cf6; }
+
     .grid2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 7px; margin-bottom: 8px; }
     .stat-box {
       padding: 8px 10px;
@@ -656,7 +710,36 @@
       margin-bottom: 7px;
     }
     .quota-card:last-child { margin-bottom: 0; }
-    .q-title { font-size: 11px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
+    .q-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text);
+      margin-bottom: 6px;
+    }
+    .q-refresh-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 20px;
+      height: 20px;
+      padding: 0;
+      border-radius: 999px;
+      border: 1px solid var(--glass-border);
+      background: var(--glass-btn);
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1;
+      cursor: pointer;
+      transition: background 0.15s ease, color 0.15s ease, transform 0.2s ease;
+    }
+    .q-refresh-btn:hover { background: var(--glass-btn-hover); color: var(--text); }
+    .q-refresh-btn:active { transform: scale(0.9); }
+    .q-refresh-btn.spinning { animation: qSpin 0.75s linear infinite; color: var(--accent-blue); }
+    @keyframes qSpin { to { transform: rotate(360deg); } }
     .q-win { margin-bottom: 6px; }
     .q-win:last-child { margin-bottom: 0; }
     .q-head {
@@ -804,6 +887,7 @@
   let manualMood = null; // { key, text } | null
   let manualMoodTimer = null;
   let lastQuotaHtml = "";
+  let pendingQuotaRefresh = false;
   let lastDragEndAt = 0;
   let themeObserver = null;
   let visHandler = null;
@@ -855,7 +939,7 @@
     host.style.top = `${top}px`;
 
     if (els.popover) {
-      els.popover.classList.toggle("open-up", top + 380 > vh && top > 280);
+      els.popover.classList.toggle("open-up", top + 450 > vh && top > 320);
     }
   };
 
@@ -949,7 +1033,7 @@
       els.wrap.classList.toggle("expanded", expanded);
       if (expanded && els.popover) {
         const vh = window.innerHeight || 800;
-        els.popover.classList.toggle("open-up", layout.top + 380 > vh && layout.top > 280);
+        els.popover.classList.toggle("open-up", layout.top + 450 > vh && layout.top > 320);
       }
     }
   };
@@ -1076,6 +1160,34 @@
     els.ctxBar.style.width = `${Math.min(100, Math.max(0, ctxPct || 0))}%`;
     els.ctxBar.className = "bar-fill" + (ctxPct >= 90 ? " bad" : ctxPct >= 80 ? " warn" : "");
 
+    // 会话消耗（总 Token + 对话轮数 + 三段明细）
+    const cRead = cache.cachedTokens || 0;
+    const cMiss = cache.uncachedTokens || 0;
+    const cOut = cache.outputTokens || 0;
+    const cBarTot = cRead + cMiss + cOut;
+    els.tokTotal.textContent = cache.totalTokens != null ? `${fmtTokens(cache.totalTokens)} tok` : "—";
+    if (typeof speed.rounds === "number") {
+      els.roundPill.textContent = `${speed.rounds} 轮`;
+      els.roundPill.title = `${speed.steps != null ? `${speed.steps} 步` : ""}${speed.requests != null ? ` · ${speed.requests} 次模型请求` : ""}`.replace(/^ · /, "");
+    } else if (typeof speed.steps === "number") {
+      els.roundPill.textContent = `${speed.steps} 步`;
+      els.roundPill.title = "超长对话已跳过全量轮数统计";
+    } else {
+      els.roundPill.textContent = "—";
+      els.roundPill.title = "";
+    }
+    els.tokSegRead.style.width = cBarTot ? `${(cRead / cBarTot) * 100}%` : "0%";
+    els.tokSegMiss.style.width = cBarTot ? `${(cMiss / cBarTot) * 100}%` : "0%";
+    els.tokSegOut.style.width = cBarTot ? `${(cOut / cBarTot) * 100}%` : "0%";
+    els.tokRead.textContent = cache.cachedTokens != null ? fmtTokens(cRead) : "—";
+    els.tokMiss.textContent = cache.uncachedTokens != null ? fmtTokens(cMiss) : "—";
+    els.tokOut.textContent = cache.outputTokens != null ? fmtTokens(cOut) : "—";
+    if (els.tokBox) {
+      const cw = cache.cacheWriteTokens || 0;
+      const thk = cache.thinkingOutputTokens || 0;
+      els.tokBox.title = cw || thk ? `缓存写入 ${fmtTokens(cw)} · 思考输出 ${fmtTokens(thk)}` : "";
+    }
+
     els.stTps.textContent = speed.tps != null ? `${speed.tps.toFixed(1)} t/s` : "—";
     els.stPeak.textContent = speed.peakTps != null ? `${speed.peakTps.toFixed(1)} t/s` : "—";
     els.stTtft.textContent = speed.ttftSeconds != null ? `${speed.ttftSeconds.toFixed(2)} s` : "—";
@@ -1084,7 +1196,7 @@
     const nextQuotaHtml = groups.length
       ? groups
           .slice(0, 4)
-          .map((g) => {
+          .map((g, idx) => {
             const title = formatGroupName(g);
             const wins = [
               { key: "5h", label: "5小时" },
@@ -1114,20 +1226,27 @@
               })
               .filter(Boolean)
               .join("");
+            const refreshBtn =
+              idx === 0
+                ? `<button class="q-refresh-btn" type="button" data-action="refresh-quota" title="立即强刷额度（换号后点一下）">↻</button>`
+                : "";
 
             return `
               <div class="quota-card">
-                <div class="q-title"><span>${title}</span></div>
+                <div class="q-title"><span>${title}</span>${refreshBtn}</div>
                 ${rowsHtml || `<div class="q-rst">暂无可用窗口</div>`}
               </div>
             `;
           })
           .join("")
-      : `<div class="quota-card"><div class="q-rst">暂无额度池信息</div></div>`;
+      : `<div class="quota-card"><div class="q-title"><span>共享额度池</span><button class="q-refresh-btn" type="button" data-action="refresh-quota" title="立即强刷额度">↻</button></div><div class="q-rst">暂无额度池信息</div></div>`;
 
     if (nextQuotaHtml !== lastQuotaHtml) {
       els.quotaList.innerHTML = nextQuotaHtml;
       lastQuotaHtml = nextQuotaHtml;
+    } else if (!pendingQuotaRefresh && els.quotaList) {
+      const spinBtn = els.quotaList.querySelector(".q-refresh-btn.spinning");
+      if (spinBtn) spinBtn.classList.remove("spinning");
     }
   };
 
@@ -1293,6 +1412,14 @@
       resetPosition();
     });
 
+    els.quotaList.addEventListener("click", (e) => {
+      const btn = e.target && e.target.closest ? e.target.closest('[data-action="refresh-quota"]') : null;
+      if (!btn) return;
+      e.stopPropagation();
+      pendingQuotaRefresh = true;
+      btn.classList.add("spinning");
+    });
+
     outsideHandler = (e) => {
       if (!expanded || !host) return;
       if (e.target === host || host.contains(e.target)) return;
@@ -1389,6 +1516,23 @@
               <div class="bar"><div class="bar-fill" id="ctxBar" style="width:0%"></div></div>
             </div>
 
+            <div class="glass-box" id="tokBox">
+              <div class="row">
+                <span class="row-l">会话消耗 <span class="round-pill" id="roundPill">—</span></span>
+                <span class="row-r" id="tokTotal">—</span>
+              </div>
+              <div class="tok-bar">
+                <div class="tok-seg read" id="tokSegRead" style="width:0%"></div>
+                <div class="tok-seg miss" id="tokSegMiss" style="width:0%"></div>
+                <div class="tok-seg out" id="tokSegOut" style="width:0%"></div>
+              </div>
+              <div class="tok-sub">
+                <span class="tok-item"><span class="tok-dot read"></span>缓读 <strong id="tokRead">—</strong></span>
+                <span class="tok-item"><span class="tok-dot miss"></span>未缓 <strong id="tokMiss">—</strong></span>
+                <span class="tok-item"><span class="tok-dot out"></span>输出 <strong id="tokOut">—</strong></span>
+              </div>
+            </div>
+
             <div class="grid2">
               <div class="stat-box"><div class="stat-k">平均速率</div><div class="stat-v c-blue" id="stTps">—</div></div>
               <div class="stat-box"><div class="stat-k">峰值速率</div><div class="stat-v c-purple" id="stPeak">—</div></div>
@@ -1432,6 +1576,15 @@
       ctxText: q("ctxText"),
       ctxBadge: q("ctxBadge"),
       ctxBar: q("ctxBar"),
+      tokBox: q("tokBox"),
+      roundPill: q("roundPill"),
+      tokTotal: q("tokTotal"),
+      tokSegRead: q("tokSegRead"),
+      tokSegMiss: q("tokSegMiss"),
+      tokSegOut: q("tokSegOut"),
+      tokRead: q("tokRead"),
+      tokMiss: q("tokMiss"),
+      tokOut: q("tokOut"),
       stTps: q("stTps"),
       stPeak: q("stPeak"),
       stTtft: q("stTtft"),
@@ -1520,14 +1673,19 @@
     };
   };
 
-  const hint = () => ({
-    mounted: Boolean(host && document.contains(host)),
-    hidden: Boolean(document.hidden),
-    href: location.href,
-    title: document.title,
-    crumbTitle: readBreadcrumbTitle(),
-    activeCid: readActiveConversationId(),
-  });
+  const hint = () => {
+    const wantQuotaRefresh = pendingQuotaRefresh;
+    pendingQuotaRefresh = false;
+    return {
+      mounted: Boolean(host && document.contains(host)),
+      hidden: Boolean(document.hidden),
+      href: location.href,
+      title: document.title,
+      crumbTitle: readBreadcrumbTitle(),
+      activeCid: readActiveConversationId(),
+      wantQuotaRefresh,
+    };
+  };
 
   const destroy = () => {
     clearTimeout(manualMoodTimer);
